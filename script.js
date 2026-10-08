@@ -461,28 +461,29 @@ const COMMON_FOODS = [
 ];
 
 /* =====================================================================
-   GERADOR DE CARDÁPIO
-   Combina somente alimentos que costumam andar juntos em cada refeição.
+   MOTOR DE COMPOSIÇÃO DE REFEIÇÕES
+   Não existe lista fixa de receitas nem de alimentos. A cada geração o motor:
+   1. lê os alimentos cadastrados (S.foods);
+   2. deduz as FUNÇÕES de cada alimento (proteína, carboidrato, fruta...) pela
+      categoria + valores nutricionais + algumas dicas de nome (um alimento pode
+      ter mais de uma função);
+   3. monta estruturas simples por tipo de refeição (ex.: proteína + carbo + legume);
+   4. escolhe porções fáceis de medir para chegar perto da meta da refeição;
+   5. pontua (meta, proteína, compatibilidade, simplicidade) e escolhe as melhores
+      combinações, evitando repetir e quase repetir.
    ===================================================================== */
 const MEAL_IDS = ['breakfast', 'snack_am', 'lunch', 'snack_pm', 'dinner'];
 const MEAL_BY_ID = Object.fromEntries(MEAL_PLAN.map(m => [m.id, m]));
+const mealGroup = id => (id === 'lunch' || id === 'dinner' ? 'main' : id === 'breakfast' ? 'breakfast' : 'snack');
 
-function foodMeals(f) {
-  const n = norm(f.name);
-  switch (f.cat) {
-    case 'proteinas':
-      if (/ovo/.test(n)) return MEAL_IDS;
-      if (/atum|sardinha/.test(n)) return ['snack_pm', 'lunch', 'dinner'];
-      return ['lunch', 'dinner'];
-    case 'carboidratos':
-      if (/pao|tapioca|torrada|granola|cereal|biscoito|bolacha|cuscuz|aveia|wrap/.test(n)) return ['breakfast', 'snack_am', 'snack_pm'];
-      return ['lunch', 'dinner'];
-    case 'frutas': return ['breakfast', 'snack_am', 'snack_pm'];
-    case 'vegetais': return ['lunch', 'dinner'];
-    case 'laticinios': return ['breakfast', 'snack_am', 'snack_pm'];
-    default: return [];
-  }
+/* ---------- utilidades ---------- */
+function hashStr(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 }
+function shuffled(arr, rand) { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+
 const foodGPU = f => ((f.unit === 'unidade' || f.unit === 'fatia') ? (+f.gPerUnit > 0 ? +f.gPerUnit : 100) : null);
 function foodAvailG(f) {
   if (f.qty == null || f.qty === '') return Infinity;
@@ -495,144 +496,323 @@ function foodAvailG(f) {
     default: return Infinity;
   }
 }
-function mkItem(f, g) {
+function mkItem(f, g, role) {
   const gpu = foodGPU(f);
-  if (gpu) { const n = Math.max(1, Math.round(g / gpu)); return { f, n, g: n * gpu }; }
-  const gg = g >= 100 ? Math.round(g / 10) * 10 : Math.max(5, Math.round(g / 5) * 5);
-  return { f, n: null, g: gg };
+  if (gpu) { const n = Math.max(1, Math.round(g / gpu)); return { f, n, g: n * gpu, role }; }
+  return { f, n: null, g, role };
 }
 const itemMacro = (it, k) => (it.f[k] || 0) * it.g / 100;
-const RX = {
-  egg: /ovo/, bread: /pao|tapioca|torrada|cuscuz|wrap/, spread: /requeij|queijo|ricota|cottage|cream/,
-  oats: /aveia|granola/, yog: /iogurte|kefir|leite/, rice: /arroz|macarr|mandioca|inhame|cuscuz|polenta|quinoa/,
-  potato: /batata|mandioca|inhame/, bean: /feij|lentilha|grao.de.bico|ervilha/
-};
-const NOT_PROT = /ovo|feij|lentilha|grao|ervilha|whey/;
-const sl = (cats, g, r, o = {}) => ({ cats, g, r, ...o });
 
-const PATTERNS = {
+/* ---------- alimento saudável? (o usuário pode forçar em "Usar nas sugestões") ---------- */
+const UNHEALTHY_RX = /refrigerante|salgadinho|recheado|\bbolo\b|chocolate|sorvete|pizza|hamburguer|nugget|salsicha|linguica|mortadela|bacon|presunto|empanado|frito|maionese|energetico|refresco|margarina|achocolatado|sonho|coxinha|pastel|cerveja|vodka|vinho|cachaca|leite condensado|geleia|pao de queijo|miojo|macarrao instantaneo|biscoito|bolacha|\bbalas?\b|pirulito|ketchup|catchup|doce de leite|\bdoces\b|pacoca|brigadeiro/;
+const DENSE_OK_RX = /aveia|castanha|amendoim|nozes|azeite|chia|linhaca|granola|whey|leite em po|cacau|semente|pasta de|oleo|azeitona|abacate|queijo|requeij/;
+function foodHealthy(f) {
+  if (f.healthy === 'yes') return true;
+  if (f.healthy === 'no') return false;
+  const n = norm(f.name);
+  if (UNHEALTHY_RX.test(n)) return false;
+  const k = +f.kcal || 0, fa = +f.f || 0, p = +f.p || 0;
+  if (k > 520 && !DENSE_OK_RX.test(n)) return false;
+  if (fa > 30 && p < 10 && !DENSE_OK_RX.test(n)) return false;
+  return true;
+}
+
+/* ---------- funções nutricionais (um alimento pode ter várias) ---------- */
+const RX_TOPPING = /aveia|granola|chia|linhaca|castanha|amendoim|nozes|amendoa|cacau|gergelim|coco ralado|semente/;
+const RX_LEGUME = /feij|lentilha|grao.de.bico|ervilha|soja/;
+function foodRoles(f) {
+  const n = norm(f.name), k = +f.kcal || 0, p = +f.p || 0, c = +f.c || 0;
+  const R = new Set();
+  const legume = RX_LEGUME.test(n);
+  if (legume) R.add('legume');
+  switch (f.cat) {
+    case 'proteinas': if (!legume || p >= 12) R.add('protein'); break;
+    case 'carboidratos': if (!legume) R.add('carb'); if (RX_TOPPING.test(n)) R.add('topping'); break;
+    case 'frutas': R.add('fruit'); break;
+    case 'vegetais': R.add('veg'); break;
+    case 'laticinios': R.add('dairy'); if (p >= 12) R.add('protein'); if (k >= 250 || RX_TOPPING.test(n)) R.add('topping'); break;
+    default:
+      if (RX_TOPPING.test(n)) R.add('topping');
+      if (p >= 15 && c < 15) R.add('protein');
+      else if (c >= 50 && p < 12 && !R.size) R.add('carb');
+  }
+  if (!R.size) { if (p >= 12 && c < 15) R.add('protein'); else if (c >= 15 && p < 12) R.add('carb'); }
+  return R;
+}
+
+/* ---------- compatibilidade com o tipo de refeição (prioriza, não proíbe) ---------- */
+const BASE_AFF = {
+  breakfast: { protein: 0.5, dairy: 1, carb: 0.5, fruit: 1, veg: 0.05, legume: 0.05, topping: 1 },
+  snack: { protein: 0.45, dairy: 1, carb: 0.4, fruit: 1, veg: 0.1, legume: 0.05, topping: 0.8 },
+  main: { protein: 1, carb: 1, legume: 1, veg: 1, fruit: 0.05, dairy: 0.1, topping: 0.05 }
+};
+const RX_MAIN_ONLY = /arroz|feij|macarr|batata|mandioca|inhame|frango|carne|patinho|acem|bife|tilapia|salmao|lombo|peru|lentilha|grao.de.bico|sardinha|atum|peixe|polenta|quinoa|file|figado|costela|porco/;
+const RX_BF_LIKE = /pao|tapioca|granola|torrada|cereal|aveia|cuscuz|leite|iogurte|queijo|requeij|cottage|ricota|ovo|banana|mamao|cafe|whey/;
+const RX_BF_ONLY = /pao|tapioca|granola|torrada|cereal|aveia|biscoito|leite em po|requeij/;
+function affinity(f, role, group) {
+  const n = norm(f.name);
+  let a = (BASE_AFF[group] && BASE_AFF[group][role]) ?? 0.3;
+  if (group === 'main') {
+    if (RX_BF_ONLY.test(n)) a = Math.min(a, 0.12);
+    else if (RX_MAIN_ONLY.test(n)) a = Math.max(a, 0.95);
+    if (/ovo/.test(n)) a = Math.max(a, 0.7);
+    if (f.cat === 'laticinios') a = Math.min(a, 0.3);
+    if (/whey/.test(n)) a = Math.min(a, 0.1);
+  } else {
+    if (RX_MAIN_ONLY.test(n)) a = Math.min(a, 0.12);
+    else if (RX_BF_LIKE.test(n)) a = Math.max(a, 0.85);
+    if (group === 'snack' && /cuscuz/.test(n)) a = Math.min(a, 0.3);
+  }
+  return clamp(a, 0, 1);
+}
+const MIN_AFF = 0.25;
+
+/* ---------- estruturas de refeição (por função, nunca por alimento) ---------- */
+const SL = (roles, opt = false) => ({ roles: [].concat(roles), opt });
+const STRUCTS = {
+  main: [
+    [SL('protein'), SL('carb'), SL('veg')],
+    [SL('protein'), SL('carb'), SL('veg', true)],
+    [SL('protein'), SL('carb'), SL('legume'), SL('veg', true)],
+    [SL('protein'), SL('legume'), SL('veg', true)],
+    [SL('protein'), SL('carb'), SL('veg'), SL('veg', true)]
+  ],
   breakfast: [
-    [sl(['proteinas'], 100, [100, 150], { re: RX.egg }), sl(['carboidratos'], 50, [25, 100], { re: RX.bread, flex: 1 }), sl(['laticinios'], 15, [10, 30], { re: RX.spread, opt: 1 }), sl(['frutas'], 175, [100, 250], { flex: 1 }), sl(['carboidratos'], 10, [10, 20], { re: RX.oats, opt: 1 })],
-    [sl(['laticinios'], 170, [120, 250], { re: RX.yog, notRe: /po\b|em po/, flex: 1 }), sl(['carboidratos'], 30, [15, 50], { re: RX.oats, flex: 1 }), sl(['frutas'], 120, [80, 200], { flex: 1 }), sl(['proteinas'], 50, [50, 100], { re: RX.egg, opt: 1 })],
-    [sl(['proteinas'], 100, [100, 150], { re: RX.egg }), sl(['carboidratos'], 60, [25, 100], { re: RX.bread, flex: 1 }), sl(['frutas'], 150, [100, 250], { flex: 1 })]
+    [SL(['protein', 'dairy']), SL('carb'), SL('fruit'), SL('topping', true)],
+    [SL('dairy'), SL('topping'), SL('fruit')],
+    [SL(['protein', 'dairy']), SL('fruit'), SL('topping', true)]
   ],
-  snack_am: [
-    [sl(['frutas'], 120, [80, 200], { flex: 1 }), sl(['proteinas'], 50, [50, 100], { re: RX.egg })],
-    [sl(['frutas'], 100, [80, 160], { flex: 1 }), sl(['carboidratos'], 15, [10, 30], { re: RX.oats, flex: 1 })],
-    [sl(['laticinios'], 120, [80, 170], { re: RX.yog, notRe: /po\b|em po/, flex: 1 }), sl(['frutas'], 80, [60, 150], { flex: 1 }), sl(['carboidratos'], 10, [10, 20], { re: RX.oats, opt: 1 })]
-  ],
-  snack_pm: [
-    [sl(['laticinios'], 170, [120, 250], { re: RX.yog, notRe: /po\b|em po/, flex: 1 }), sl(['frutas'], 100, [80, 160], { flex: 1 }), sl(['carboidratos'], 15, [10, 30], { re: RX.oats, flex: 1 })],
-    [sl(['frutas'], 100, [80, 160], { flex: 1 }), sl(['proteinas'], 100, [100, 150], { re: RX.egg })],
-    [sl(['carboidratos'], 50, [25, 75], { re: RX.bread, flex: 1 }), sl(['laticinios'], 30, [20, 50], { re: RX.spread, flex: 1 })]
-  ],
-  lunch: [
-    [sl(['proteinas'], 170, [150, 180], { notRe: NOT_PROT, flex: 1 }), sl(['carboidratos'], 110, [70, 140], { re: RX.rice, flex: 1 }), sl(['carboidratos', 'proteinas'], 90, [60, 110], { re: RX.bean, opt: 1 }), sl(['vegetais'], 250, [200, 300], { veg: 1 })],
-    [sl(['proteinas'], 170, [150, 180], { notRe: NOT_PROT, flex: 1 }), sl(['carboidratos'], 200, [120, 280], { re: RX.potato, flex: 1 }), sl(['vegetais'], 250, [200, 300], { veg: 1 })]
-  ],
-  dinner: [
-    [sl(['proteinas'], 160, [130, 180], { notRe: NOT_PROT, flex: 1 }), sl(['carboidratos'], 100, [60, 130], { re: RX.rice, flex: 1 }), sl(['carboidratos', 'proteinas'], 80, [50, 100], { re: RX.bean, opt: 1 }), sl(['vegetais'], 250, [200, 300], { veg: 1 })],
-    [sl(['proteinas'], 160, [130, 180], { notRe: NOT_PROT, flex: 1 }), sl(['carboidratos'], 200, [100, 260], { re: RX.potato, flex: 1 }), sl(['vegetais'], 250, [200, 300], { veg: 1 })]
+  snack: [
+    [SL('fruit'), SL(['protein', 'dairy'])],
+    [SL('fruit'), SL('topping')],
+    [SL('dairy'), SL('fruit'), SL('topping', true)],
+    [SL('carb'), SL(['protein', 'dairy'])]
   ]
 };
 
-function slotFoods(slot, mealId) {
-  return S.foods.filter(f => {
-    if (!slot.cats.includes(f.cat)) return false;
-    if (!foodMeals(f).includes(mealId)) return false;
-    const n = norm(f.name);
-    if (slot.re && !slot.re.test(n)) return false;
-    if (slot.notRe && slot.notRe.test(n)) return false;
-    if (!(+f.kcal >= 0)) return false;
-    return foodAvailG(f) > 0;
-  });
+/* ---------- metas por refeição, escaladas pela meta diária do usuário ---------- */
+function mealTargets(mealId) {
+  const m = MEAL_BY_ID[mealId], s = S.settings;
+  const gm = ((+s.kcalMin || 2000) + (+s.kcalMax || 2100)) / 2;
+  const k = clamp(gm / 2050, 0.6, 1.8);
+  const pm = ((+s.protMin || 140) + (+s.protMax || 160)) / 2;
+  const mid = ((m.min + m.max) / 2) * k;
+  return { lo: m.min * k, hi: m.max * k, mid, pT: pm * (((m.min + m.max) / 2) / 1940), k };
 }
-/* opções de cada espaço: lista de listas de { f, g } */
-function slotOptions(slot, mealId) {
-  const foods = slotFoods(slot, mealId).slice(0, slot.veg ? 6 : 5);
-  let opts;
-  if (slot.veg) {
-    opts = foods.map(f => [{ f, g: slot.g }]);
-    for (let i = 0; i < foods.length; i++) for (let j = i + 1; j < foods.length; j++) {
-      if (opts.length > 14) break;
-      opts.push([{ f: foods[i], g: slot.g / 2 }, { f: foods[j], g: slot.g / 2 }]);
-    }
-  } else {
-    opts = foods.slice(0, slot.opt ? 3 : 5).map(f => [{ f, g: slot.g }]);
-  }
-  if (slot.opt) opts.unshift([]);
-  return opts;
-}
-function* product(lists, i = 0, acc = []) {
-  if (i === lists.length) { yield acc; return; }
-  for (const o of lists[i]) yield* product(lists, i + 1, [...acc, { slot: i, items: o }]);
-}
-function buildCombos(mealId) {
-  const meal = MEAL_BY_ID[mealId];
-  const mid = (meal.min + meal.max) / 2;
-  const results = [];
-  const seen = new Set();
-  let guard = 0;
-  (PATTERNS[mealId] || []).forEach(pattern => {
-    const lists = pattern.map(s => slotOptions(s, mealId));
-    if (lists.some((l, i) => !l.length || (!pattern[i].opt && !l.some(o => o.length)))) return;
-    for (const pick of product(lists)) {
-      if (++guard > 6000) return;
-      const raw = [];
-      pick.forEach(p => p.items.forEach(it => raw.push({ ...it, slot: pattern[p.slot] })));
-      if (!raw.length) continue;
-      const ids = raw.map(r => r.f.id);
-      if (new Set(ids).size !== ids.length) continue;
-      const kc = r => (r.f.kcal || 0) * r.g / 100;
-      const fixed = sum(raw.filter(r => !r.slot.flex).map(kc));
-      const flex = sum(raw.filter(r => r.slot.flex).map(kc));
-      const s = flex > 0 ? clamp((mid - fixed) / flex, 0.6, 1.5) : 1;
-      const items = raw.map(r => {
-        let g = r.g;
-        if (r.slot.flex) g = clamp(g * s, r.slot.r[0], r.slot.r[1]);
-        return mkItem(r.f, g);
-      });
-      if (items.some(it => it.g > foodAvailG(it.f) + 1e-9)) continue;
-      const tot = { kcal: sum(items.map(i => itemMacro(i, 'kcal'))), p: sum(items.map(i => itemMacro(i, 'p'))), c: sum(items.map(i => itemMacro(i, 'c'))), f: sum(items.map(i => itemMacro(i, 'f'))) };
-      const key = items.map(i => i.f.id + ':' + (i.n || i.g)).sort().join('|');
-      if (seen.has(key)) continue;
-      seen.add(key);
-      results.push({ items, ...tot, pattern: pattern[0].g, mealId });
-    }
-  });
-  return { results, meal, mid };
-}
-function suggestMeals(mealId, mode = 'balanced', limit = 6) {
-  const { results, meal, mid } = buildCombos(mealId);
-  let list = results.filter(r => r.kcal >= meal.min * 0.9 && r.kcal <= meal.max * 1.1);
-  let approx = false;
-  if (!list.length) { list = results.filter(r => r.kcal >= meal.min * 0.75 && r.kcal <= meal.max * 1.25); approx = list.length > 0; }
-  const score = r => Math.abs(r.kcal - mid) / mid;
-  if (mode === 'protein') list.sort((a, b) => b.p - a.p || score(a) - score(b));
-  else if (mode === 'lowcal') list.sort((a, b) => a.kcal - b.kcal || b.p - a.p);
-  else list.sort((a, b) => score(a) - score(b) || b.p - a.p);
+
+/* ---------- reservatório de alimentos para cada função ---------- */
+function poolFor(roles, group, allowed) {
   const out = [];
-  const used = {};
-  for (const r of list) {
-    const k = r.items[0].f.id;
-    if ((used[k] || 0) >= 2) continue;
-    used[k] = (used[k] || 0) + 1;
-    out.push({ ...r, approx });
-    if (out.length >= limit) break;
+  S.foods.forEach(f => {
+    if (allowed && !allowed.has(f.id)) return;
+    if (!foodHealthy(f) || !(+f.kcal >= 0) || foodAvailG(f) <= 0) return;
+    const R = foodRoles(f);
+    let best = null;
+    roles.forEach(r => { if (R.has(r)) { const a = affinity(f, r, group); if (!best || a > best.aff) best = { f, role: r, aff: a }; } });
+    if (best && best.aff >= MIN_AFF) out.push(best);
+  });
+  return out;
+}
+
+/* ---------- porções fáceis de medir ---------- */
+const FRIENDLY = [10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100, 120, 150, 180, 200, 250, 300];
+const RANGE_T = { protein: [[80, 180], [20, 70]], carb: [[50, 200], [10, 80]], legume: [[50, 120], [30, 80]], veg: [[100, 250], [50, 100]], fruit: [[80, 200], [30, 100]], dairy: [[100, 200], [15, 50]], topping: [[10, 30], [10, 30]] };
+const TYP_G = { protein: { main: 100, breakfast: 100, snack: 60 }, carb: { main: 120, breakfast: 50, snack: 40 }, legume: { main: 80, breakfast: 80, snack: 80 }, veg: { main: 120, breakfast: 100, snack: 100 }, fruit: { main: 120, breakfast: 140, snack: 120 }, dairy: { main: 100, breakfast: 150, snack: 150 }, topping: { main: 15, breakfast: 15, snack: 15 } };
+const FLEX = new Set(['protein', 'carb', 'dairy']);
+const isDense = (f, role) => (role === 'protein' ? (f.cat === 'laticinios' || (+f.kcal || 0) >= 350) : (+f.kcal || 0) >= 250);
+const RANGE_MAIN = { protein: [[100, 180], [20, 70]], carb: [[70, 180], [10, 80]] };
+function portionCandidates(f, role, group) {
+  const dense = isDense(f, role);
+  const rg = group === 'main' && RANGE_MAIN[role] ? RANGE_MAIN[role] : (group !== 'main' && role === 'protein' ? [[50, 150], [20, 70]] : RANGE_T[role]);
+  const [lo, hi] = rg[dense ? 1 : 0];
+  const avail = foodAvailG(f), gpu = foodGPU(f);
+  let list;
+  if (gpu) list = [1, 2, 3].map(n => n * gpu).filter((g, i) => i === 0 || (g <= hi * 1.3 && g >= lo * 0.6));
+  else list = FRIENDLY.filter(g => g >= lo && g <= hi);
+  list = list.filter(g => g <= avail + 1e-9);
+  if (!list.length) return null;
+  let typ = TYP_G[role][group];
+  if (dense) typ = clamp(typ * 0.5, lo, hi);
+  typ = list.reduce((a, b) => (Math.abs(b - typ) < Math.abs(a - typ) ? b : a));
+  return { list, typ };
+}
+function thin(list, n) {
+  if (list.length <= n) return list;
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(list[Math.round((i * (list.length - 1)) / (n - 1))]);
+  return [...new Set(out)];
+}
+
+/* ---------- transforma uma escolha de alimentos em uma refeição com porções ---------- */
+function finishCombo(picks, mealId, ctx) {
+  const opts = picks.map(pk => ({ pk, cand: portionCandidates(pk.f, pk.role, ctx.group) }));
+  if (opts.some(o => !o.cand)) return null;
+  const flex = [], fixed = [];
+  opts.forEach((o, i) => (FLEX.has(o.pk.role) && o.cand.list.length > 1 ? flex.push(i) : fixed.push(i)));
+  const lists = flex.map(i => thin(opts[i].cand.list, 5));
+  const base = opts.map(o => o.cand.typ);
+  let best = null;
+  const cost = g => {
+    let kcal = 0, prot = 0, dev = 0;
+    opts.forEach((o, i) => { kcal += (o.pk.f.kcal || 0) * g[i] / 100; prot += (o.pk.f.p || 0) * g[i] / 100; dev += Math.abs(g[i] - o.cand.typ) / o.cand.typ; });
+    const kdev = kcal < ctx.lo ? (ctx.lo - kcal) / ctx.mid : kcal > ctx.hi ? (kcal - ctx.hi) / ctx.mid : Math.abs(kcal - ctx.mid) / ctx.mid * 0.3;
+    const pshort = Math.max(0, ctx.pT - prot) / ctx.pT;
+    const pexc = Math.max(0, prot - 1.4 * ctx.pT) / ctx.pT;
+    return kdev * 100 + pshort * 25 + pexc * 20 + dev * 1.5;
+  };
+  const walk = (k, g) => {
+    if (k === flex.length) { const c = cost(g); if (!best || c < best.c) best = { c, g: g.slice() }; return; }
+    for (const v of lists[k]) { g[flex[k]] = v; walk(k + 1, g); }
+  };
+  walk(0, base.slice());
+  const items = opts.map((o, i) => mkItem(o.pk.f, best.g[i], o.pk.role));
+  const tot = { kcal: sum(items.map(i => itemMacro(i, 'kcal'))), p: sum(items.map(i => itemMacro(i, 'p'))), c: sum(items.map(i => itemMacro(i, 'c'))), f: sum(items.map(i => itemMacro(i, 'f'))) };
+  if (tot.kcal < ctx.lo * 0.72 || tot.kcal > ctx.hi * 1.15) return null;
+  const aff = avg(picks.map(p => p.aff));
+  const c = { items, ...tot, aff, mealId, approx: tot.kcal < ctx.lo || tot.kcal > ctx.hi };
+  c.score = scoreCombo(c, ctx);
+  return c;
+}
+function scoreCombo(c, ctx) {
+  let s = 100;
+  const dev = c.kcal < ctx.lo ? (ctx.lo - c.kcal) / ctx.mid : c.kcal > ctx.hi ? (c.kcal - ctx.hi) / ctx.mid : Math.abs(c.kcal - ctx.mid) / ctx.mid * 0.3;
+  s -= dev * 120;
+  const pr = c.p / ctx.pT;
+  s += clamp(pr, 0, 1.15) * 22;
+  if (pr < 0.6) s -= (0.6 - pr) * 30;
+  s += c.aff * 18;
+  const n = c.items.length;
+  if (n > 4) s -= (n - 4) * 14; else if (n === 2) s -= 3;
+  const fatPct = (c.f * 9) / Math.max(c.kcal, 1);
+  if (fatPct > 0.45) s -= (fatPct - 0.45) * 40;
+  if (ctx.group === 'main' && c.items.some(i => i.role === 'veg')) s += 4;
+  return s;
+}
+
+/* ---------- gera candidatos: todo alimento entra em algumas combinações ---------- */
+function weightedPick(arr, rand) {
+  const w = arr.map(x => x.aff * x.aff + 0.05);
+  let r = rand() * sum(w);
+  for (let i = 0; i < arr.length; i++) { r -= w[i]; if (r <= 0) return arr[i]; }
+  return arr[arr.length - 1];
+}
+function generateCandidates(mealId, ctx) {
+  const rand = rng(ctx.seed);
+  const seen = new Map();
+  STRUCTS[ctx.group].forEach(st => {
+    const pools = st.map(sl => poolFor(sl.roles, ctx.group, ctx.allowed));
+    if (st.some((sl, i) => !sl.opt && !pools[i].length)) return;
+    const build = (forceSlot, force) => {
+      const used = new Set();
+      if (force) used.add(force.f.id);
+      const picks = [];
+      for (let i = 0; i < st.length; i++) {
+        if (i === forceSlot) { picks.push(force); continue; }
+        if (st[i].opt && rand() > 0.55) continue;
+        const avail = pools[i].filter(x => !used.has(x.f.id));
+        if (!avail.length) { if (st[i].opt) continue; return null; }
+        const pk = weightedPick(avail, rand);
+        used.add(pk.f.id); picks.push(pk);
+      }
+      return picks;
+    };
+    const attempts = [];
+    st.forEach((sl, i) => shuffled(pools[i], rand).slice(0, 10).forEach(x => { attempts.push([i, x]); attempts.push([i, x]); }));
+    for (let r = 0; r < 8; r++) attempts.push([-1, null]);
+    attempts.forEach(([i, x]) => {
+      const picks = build(i, x);
+      if (!picks || picks.length < 2) return;
+      const c = finishCombo(picks, mealId, ctx);
+      if (!c) return;
+      const key = c.items.map(it => it.f.id).sort().join('|');
+      const prev = seen.get(key);
+      if (!prev || c.score > prev.score) seen.set(key, c);
+    });
+  });
+  return [...seen.values()];
+}
+
+/* ---------- escolhe as melhores, diferentes entre si ---------- */
+const coreKey = c => c.items.filter(i => ['protein', 'carb', 'legume', 'dairy', 'fruit'].includes(i.role)).map(i => i.f.id).sort().join('|');
+function pickDiverse(cands, limit, mode) {
+  const rank = c => c.score + (mode === 'protein' ? c.p * 1.1 : mode === 'lowcal' ? -c.kcal / 8 : 0);
+  let pool = cands.slice().sort((a, b) => rank(b) - rank(a)).slice(0, 250);
+  const out = [], used = new Map(), cores = new Set();
+  while (out.length < limit && pool.length) {
+    let bi = -1, bs = -Infinity;
+    for (let i = 0; i < pool.length; i++) {
+      const c = pool[i];
+      if (cores.has(coreKey(c))) continue; // mesma refeição com só um complemento diferente
+      let pen = 0;
+      c.items.forEach((it, j) => { pen += (used.get(it.f.id) || 0) * (j === 0 ? 24 : 9); });
+      const s = rank(c) - pen;
+      if (s > bs) { bs = s; bi = i; }
+    }
+    if (bi < 0) break;
+    const c = pool.splice(bi, 1)[0];
+    out.push(c); cores.add(coreKey(c));
+    c.items.forEach(it => used.set(it.f.id, (used.get(it.f.id) || 0) + 1));
   }
   return out;
 }
-function buildDay(idx = 0) {
-  const meals = MEAL_IDS.map(id => {
-    const list = suggestMeals(id, 'balanced', 6);
-    return { id, name: MEAL_BY_ID[id].name, combo: list.length ? list[idx % list.length] : null };
-  });
+
+/* ---------- motivo quando não há como montar ---------- */
+function missingReason(mealId, allowed) {
+  const group = mealGroup(mealId), name = MEAL_BY_ID[mealId].name.toLowerCase();
+  const has = r => poolFor([r], group, allowed).length > 0;
+  const total = S.foods.filter(f => (!allowed || allowed.has(f.id))).length;
+  const excl = S.foods.filter(f => (!allowed || allowed.has(f.id)) && !foodHealthy(f)).length;
+  const exclTxt = excl ? ` ${excl} ${excl === 1 ? 'alimento foi deixado de fora' : 'alimentos foram deixados de fora'} por não ${excl === 1 ? 'ser considerado saudável' : 'serem considerados saudáveis'} (você pode mudar isso ao editar o alimento).` : '';
+  if (!total) return 'Não há alimentos para usar. Cadastre ou selecione alguns alimentos.';
+  const miss = [];
+  if (group === 'main') {
+    if (!has('protein')) miss.push('uma proteína (ex.: frango, ovos, sardinha)');
+    if (!has('carb') && !has('legume')) miss.push('um carboidrato ou feijão (ex.: arroz, batata)');
+    if (!has('veg') && miss.length === 0) miss.push('legumes ou verduras');
+  } else if (group === 'breakfast') {
+    if (!has('fruit') && !has('dairy') && !has('protein')) miss.push('uma fruta, iogurte ou ovos');
+    if (!has('carb') && !has('topping') && !has('fruit')) miss.push('um pão, cuscuz, aveia ou fruta');
+  } else if (!has('fruit') && !has('dairy') && !has('protein')) miss.push('uma fruta, iogurte ou ovos');
+  if (miss.length) return `Não há ingredientes suficientes para ${name}. Falta ${miss.join(' e ')}.${exclTxt}`;
+  return `Com esses alimentos não consegui montar uma refeição plausível para ${name} dentro da meta. Tente incluir mais opções de proteína, carboidrato ou legumes.${exclTxt}`;
+}
+
+/* ---------- API pública do motor ---------- */
+function composeMeals(mealId, mode = 'balanced', limit = 5, opts = {}) {
+  const allowed = opts.allowed || null;
+  const t = mealTargets(mealId), group = mealGroup(mealId);
+  if (allowed && allowed.size === 0) return { list: [], t, reason: 'Selecione ao menos um alimento para eu montar as sugestões.' };
+  const seed = (((typeof ui !== 'undefined' ? ui.seed : 0) | 0) * 7919 + hashStr(mealId) + (opts.seedAdd || 0)) >>> 0;
+  const ctx = { ...t, group, allowed, seed };
+  let cands = generateCandidates(mealId, ctx);
+  if (mode === 'lowcal') { const f = cands.filter(c => c.kcal >= t.lo * 0.95); if (f.length) cands = f; }
+  const list = pickDiverse(cands, limit, mode);
+  return { list, t, reason: list.length ? '' : missingReason(mealId, allowed) };
+}
+const suggestMeals = (mealId, mode, limit, opts) => composeMeals(mealId, mode, limit, opts).list;
+
+/* dia completo: escolhe, entre as melhores opções de cada refeição, a soma mais próxima da meta diária */
+function buildDay(idx = 0, allowed = null) {
+  const lists = MEAL_IDS.map(id => composeMeals(id, 'balanced', 6, { allowed, seedAdd: 13 }).list);
+  const s = S.settings;
+  const gm = ((+s.kcalMin || 2000) + (+s.kcalMax || 2100)) / 2, pm = ((+s.protMin || 140) + (+s.protMax || 160)) / 2;
+  const rand = rng(idx * 104729 + 17);
+  const ok = lists.every(l => l.length);
+  let best = [];
+  for (let n = 0; n < 160; n++) {
+    const pick = lists.map(l => (l.length ? l[Math.floor(rand() * l.length)] : null));
+    const got = pick.filter(Boolean);
+    const k = sum(got.map(c => c.kcal)), p = sum(got.map(c => c.p));
+    const cost = Math.abs(k - gm) / gm + 0.5 * Math.max(0, pm - p) / pm + 0.5 * Math.max(0, p - (+s.protMax || 160)) / pm + rand() * 0.02;
+    best.push({ pick, cost });
+  }
+  best.sort((a, b) => a.cost - b.cost);
+  const chosen = best.length ? best[Math.floor(rand() * Math.min(3, best.length))].pick : lists.map(() => null);
+  const meals = MEAL_IDS.map((id, i) => ({ id, name: MEAL_BY_ID[id].name, combo: chosen[i] }));
   const got = meals.filter(m => m.combo);
   return {
-    meals,
-    kcal: sum(got.map(m => m.combo.kcal)), p: sum(got.map(m => m.combo.p)),
-    c: sum(got.map(m => m.combo.c)), f: sum(got.map(m => m.combo.f)),
-    complete: got.length === MEAL_IDS.length
+    meals, kcal: sum(got.map(m => m.combo.kcal)), p: sum(got.map(m => m.combo.p)),
+    c: sum(got.map(m => m.combo.c)), f: sum(got.map(m => m.combo.f)), complete: ok
   };
 }
 function itemText(it) {
@@ -642,6 +822,33 @@ function itemText(it) {
     return `${it.n} ${u} de ${name} (${Math.round(it.g)} g)`;
   }
   return `${Math.round(it.g)} ${it.f.unit === 'ml' || it.f.unit === 'l' ? 'ml' : 'g'} de ${name}`;
+}
+
+/* ---------- interpretação simples de texto ("Tenho frango, ovos e arroz") ---------- */
+const TXT_STOP = new Set(['de', 'da', 'do', 'das', 'dos', 'com', 'em', 'e', 'a', 'o', 'as', 'os', 'um', 'uma', 'cozido', 'cozida', 'grelhado', 'grelhada', 'natural', 'integral', 'lata', 'enlatado', 'enlatada', 'fresco', 'fresca', 'cru', 'crua', 'assado', 'assada']);
+const stemW = w => { let x = w.replace(/(ao|ae|oe)s$/, 'ao'); if (x.length > 3) x = x.replace(/s$/, ''); return x; };
+const tokensOf = s => norm(s).replace(/[^a-z0-9\s-]/g, ' ').split(/[\s-]+/).filter(w => w && !TXT_STOP.has(w)).map(stemW);
+function matchFoodsByTerm(term) {
+  const n = norm(term);
+  if (/legume|verdura|salada|vegetai/.test(n)) return S.foods.filter(f => f.cat === 'vegetais');
+  if (/^fruta/.test(n)) return S.foods.filter(f => f.cat === 'frutas');
+  const tt = tokensOf(term);
+  if (!tt.length) return [];
+  return S.foods.filter(f => {
+    const ft = tokensOf(f.name);
+    return tt.every(t => ft.some(x => x === t || (t.length >= 4 && x.startsWith(t))));
+  });
+}
+function parseHomeText(text) {
+  let t = norm(text).replace(/\./g, ' ');
+  t = t.replace(/\b(eu\s+)?(tenho|temos|hoje|em casa|na geladeira|no armario|aqui)\b[:,]?/g, ' ');
+  const terms = t.split(/[,;\n+\/]|\se\s|\scom\s/).map(x => x.trim()).filter(x => x && tokensOf(x).length);
+  const found = new Map(), missing = [];
+  terms.forEach(term => {
+    const m = matchFoodsByTerm(term);
+    if (m.length) m.forEach(f => found.set(f.id, f)); else if (!missing.includes(term)) missing.push(term);
+  });
+  return { found: [...found.values()], missing };
 }
 
 /* =====================================================================
@@ -910,7 +1117,8 @@ const emptyState = (title, text, btn = '') => `<div class="empty"><div class="em
    ===================================================================== */
 const ui = {
   tab: 'home', dietTab: 'plan', mealFilter: 'breakfast', sortMode: 'balanced', dayIdx: 0, showDay: false,
-  foodQ: '', foodCat: 'all', exDay: new Date().getDay(), wRange: 'all', aRange: 90
+  foodQ: '', foodCat: 'all', exDay: new Date().getDay(), wRange: 'all', aRange: 90,
+  seed: 0, homeSel: null, homeDraft: new Set(), homeText: '', homeMsg: null
 };
 const TABS = [
   { id: 'home', label: 'Início', ic: 'home' },
@@ -1027,53 +1235,65 @@ function viewDiet() {
 function dietPlanHtml() {
   return `<div class="stack">${MEAL_PLAN.map(m => `
     <details class="meal" ${m.id === 'breakfast' ? 'open' : ''}>
-      <summary><span class="meal-name">${esc(m.name)}</span><span class="pill">${m.min}–${m.max} kcal</span>${icon('chevron', 'chev')}</summary>
+      <summary><span class="meal-name">${esc(m.name)}</span><span class="pill">${Math.round(mealTargets(m.id).lo)}–${Math.round(mealTargets(m.id).hi)} kcal</span>${icon('chevron', 'chev')}</summary>
       <ul class="plain">${m.lines.map(l => `<li>${esc(l)}</li>`).join('')}</ul>
       <button class="btn soft sm" data-action="meal-suggest" data-v="${m.id}">Ver combinações com meus alimentos</button>
     </details>`).join('')}</div>`;
 }
 function mealGroupOf(id) { return id.startsWith('snack') ? 'snack' : id; }
+const allowedSet = () => (ui.homeSel ? new Set(ui.homeSel) : null);
 function dietMenuHtml() {
   const filters = [['breakfast', 'Café da manhã'], ['snack', 'Lanche'], ['lunch', 'Almoço'], ['dinner', 'Jantar']];
   const sorts = [['balanced', 'Equilibradas'], ['protein', 'Maior proteína'], ['lowcal', 'Menor caloria']];
   const f = `<div class="chips" role="group" aria-label="Refeição">${filters.map(([id, l]) => chip(l, ui.mealFilter === id, 'meal-filter', `data-v="${id}"`)).join('')}</div>
-    <div class="chips" role="group" aria-label="Ordenar">${sorts.map(([id, l]) => chip(l, ui.sortMode === id, 'sort-mode', `data-v="${id}"`)).join('')}</div>`;
+    <div class="chips" role="group" aria-label="Ordenar">${sorts.map(([id, l]) => chip(l, ui.sortMode === id, 'sort-mode', `data-v="${id}"`)).join('')}<button type="button" class="chip" data-action="menu-shuffle">${icon('shuffle')} Outras opções</button></div>`;
   if (!S.foods.length) {
     return `${f}${emptyState('Cadastre seus alimentos', 'As sugestões usam o que você tem em casa. Comece pelos mais comuns.', `<div class="row-btns"><button class="btn primary" data-action="foods-common">Adicionar alimentos comuns</button><button class="btn ghost" data-action="food-add">Cadastrar um alimento</button></div>`)}`;
   }
+  const allowed = allowedSet();
+  const banner = allowed ? `<div class="note-box">${icon('info')}<span>Usando só os ${allowed.size} ${allowed.size === 1 ? 'alimento que você marcou' : 'alimentos que você marcou'}. <button class="link" data-action="home-reset">Usar todos os alimentos</button></span></div>` : '';
   const ids = ui.mealFilter === 'snack' ? ['snack_am', 'snack_pm'] : [ui.mealFilter];
   const groups = ids.map(id => {
     const meal = MEAL_BY_ID[id];
-    const list = suggestMeals(id, ui.sortMode, 6);
-    return `<section class="menu-group"><div class="sec-head"><h3>${esc(meal.name)}</h3><span class="pill">${meal.min}–${meal.max} kcal</span></div>
-      ${list.length ? `<div class="stack">${list.map(c => comboCard(c)).join('')}</div>` : `<p class="muted note-box">${icon('info')}<span>${esc(missingHint(id))}</span></p>`}</section>`;
+    const r = composeMeals(id, ui.sortMode, 5, { allowed });
+    return `<section class="menu-group"><div class="sec-head"><h3>${esc(meal.name)}</h3><span class="pill">${Math.round(r.t.lo)}–${Math.round(r.t.hi)} kcal</span></div>
+      ${r.list.length ? `<div class="stack">${r.list.map((c, i) => comboCard(c, i + 1)).join('')}</div><p class="muted sm">Estimativas calculadas a partir dos alimentos cadastrados.</p>` : `<p class="muted note-box">${icon('info')}<span>${esc(r.reason)}</span></p>`}</section>`;
   }).join('');
   const day = ui.showDay ? dayBuilderHtml() : '';
-  return `${f}${groups}
+  return `${f}${homeBoxHtml()}${banner}${groups}
     <section class="day-box">
       <div class="sec-head"><h3>Dia completo</h3><div class="row-btns tight">${ui.showDay ? `<button class="btn soft sm" data-action="day-next">${icon('shuffle')}Outro dia</button>` : `<button class="btn soft sm" data-action="day-show">Montar um dia</button>`}</div></div>
       ${day || '<p class="muted sm">Veja uma sugestão de cinco refeições e quanto elas somam em relação às suas metas.</p>'}
     </section>`;
 }
-function comboCard(c) {
+function homeBoxHtml() {
+  const foods = S.foods.slice().sort((a, b) => norm(a.name).localeCompare(norm(b.name)));
+  const m = ui.homeMsg;
+  let msg = '';
+  if (m) {
+    msg = (m.found.length ? `<p class="sm found-ok">${icon('check')}<span>Identifiquei: ${esc(m.found.join(', '))}.</span></p>` : '')
+      + m.missing.map(t => `<div class="miss-row"><span>Não encontrei “${esc(t)}” na sua lista de alimentos.</span><button type="button" class="mini" data-action="food-add-name" data-name="${esc(t)}">Cadastrar alimento</button></div>`).join('');
+  }
+  return `<section class="home-box" aria-labelledby="home-title">
+    <h3 id="home-title">O que tenho em casa?</h3>
+    <p class="muted sm">Informe os alimentos que você tem na geladeira e no armário. Eu monto algumas opções dentro da sua meta.</p>
+    <div class="home-text"><input id="home-text" type="text" placeholder="Tenho frango, sardinha, ovos, arroz e banana" value="${esc(ui.homeText)}" aria-label="Alimentos que tenho em casa" autocomplete="off"><button type="button" class="btn soft sm" data-action="home-parse">Identificar</button></div>
+    ${msg}
+    <div class="home-head"><strong class="sm">Ou marque na sua lista:</strong><span><button type="button" class="link" data-action="home-all">Marcar todos</button> <button type="button" class="link" data-action="home-none">Limpar</button></span></div>
+    <div class="hchips">${foods.map(f => `<label class="hchip"><input type="checkbox" data-home="${f.id}" ${ui.homeDraft.has(f.id) ? 'checked' : ''}><span>${esc(f.name)}</span></label>`).join('')}</div>
+    <button type="button" class="btn primary block" data-action="home-run">Montar sugestões</button>
+  </section>`;
+}
+function comboCard(c, n) {
   return `<article class="combo">
+    <h4 class="opt">Opção ${n}</h4>
     <ul class="plain">${c.items.map(it => `<li>${esc(itemText(it))}</li>`).join('')}</ul>
-    <div class="macros"><span><b>${Math.round(c.kcal)}</b> kcal</span><span><b>${fmtN(c.p, 0)}</b> g proteína</span><span><b>${fmtN(c.c, 0)}</b> g carboidrato</span><span><b>${fmtN(c.f, 0)}</b> g gordura</span></div>
-    ${c.approx ? '<p class="muted sm">Aproximada: fica um pouco fora da faixa da refeição.</p>' : ''}
+    <div class="macros"><span><b>≈ ${Math.round(c.kcal)}</b> kcal</span><span><b>≈ ${fmtN(c.p, 0)}</b> g proteína</span><span>${fmtN(c.c, 0)} g carboidrato</span><span>${fmtN(c.f, 0)} g gordura</span></div>
+    ${c.approx ? '<p class="muted sm">Fica um pouco fora da faixa da refeição, mas é uma combinação plausível.</p>' : ''}
   </article>`;
 }
-function missingHint(id) {
-  const need = {
-    breakfast: 'ovo ou iogurte, pão ou aveia e uma fruta',
-    snack_am: 'uma fruta e ovo, aveia ou iogurte',
-    snack_pm: 'iogurte, fruta e aveia (ou pão com queijo)',
-    lunch: 'uma proteína, arroz ou batata e legumes',
-    dinner: 'uma proteína, arroz ou batata e legumes'
-  }[id];
-  return `Ainda não encontrei combinações realistas. Cadastre ${need}, cada um na categoria certa, e confira a quantidade disponível.`;
-}
 function dayBuilderHtml() {
-  const d = buildDay(ui.dayIdx);
+  const d = buildDay(ui.dayIdx, allowedSet());
   const s = S.settings;
   const kOk = d.kcal >= s.kcalMin * 0.95 && d.kcal <= s.kcalMax * 1.05;
   const pOk = d.p >= s.protMin;
@@ -1096,6 +1316,7 @@ function foodListHtml() {
     const avail = f.qty != null && f.qty !== '' ? `${fmtN(+f.qty, +f.qty % 1 ? 1 : 0)} ${f.unit}` : 'quantidade livre';
     return `<li class="food"><div class="grow"><strong>${esc(f.name)}</strong>
       <span class="muted sm">${esc(catLabel(f.cat))}, ${esc(avail)}</span>
+      ${foodHealthy(f) ? '' : '<span class="badge warn tiny">Fora das sugestões</span>'}
       <span class="food-m">${fmtN(f.kcal, 0)} kcal, P ${fmtN(f.p, 1)}, C ${fmtN(f.c, 1)}, G ${fmtN(f.f, 1)} <em>por 100 g</em></span>
       ${f.note ? `<span class="muted sm">${esc(f.note)}</span>` : ''}</div>
       <div class="row-act"><button class="icon-btn" data-action="food-edit" data-id="${f.id}" aria-label="Editar ${esc(f.name)}">${icon('edit')}</button><button class="icon-btn" data-action="food-del" data-id="${f.id}" aria-label="Excluir ${esc(f.name)}">${icon('trash')}</button></div></li>`;
@@ -1574,17 +1795,18 @@ function showCelebration(g) {
 
 /* ---------- alimentos ---------- */
 const numStr = v => (v == null || v === '' ? '' : String(v).replace('.', ','));
-function openFood(id) {
+function openFood(id, preset = {}) {
   const f = id ? S.foods.find(x => x.id === id) : null;
   const body = `
-    ${field('Nome', textInput('name', f ? f.name : '', 'maxlength="60" required placeholder="Ex.: Peito de frango"'))}
+    ${field('Nome', textInput('name', f ? f.name : (preset.name || ''), 'maxlength="60" required placeholder="Ex.: Peito de frango"'))}
     ${field('Categoria', selectInput('cat', CATS.map(c => ({ v: c.id, t: c.label })), f ? f.cat : 'proteinas'))}
     <div class="row2">${field('Quantidade disponível', numInput('qty', numStr(f && f.qty), 'placeholder="Opcional"'))}${field('Unidade', selectInput('unit', UNITS.map(u => ({ v: u, t: u })), f ? f.unit : 'g'))}</div>
     <div id="gpu-box" class="hidden">${field('Peso de cada unidade (g)', numInput('gPerUnit', numStr(f && f.gPerUnit)), 'Usado para calcular porções. Ex.: 1 ovo tem cerca de 50 g.')}</div>
     ${field('Calorias por 100 g (kcal)', numInput('kcal', numStr(f && f.kcal), 'required'))}
     <div class="row3">${field('Proteínas (g)', numInput('p', numStr(f && f.p)))}${field('Carboidratos (g)', numInput('c', numStr(f && f.c)))}${field('Gorduras (g)', numInput('f', numStr(f && f.f)))}</div>
     <p class="muted sm">Valores por 100 g, como no rótulo. Campos de macros em branco contam como zero.</p>
-    ${field('Observação (opcional)', textInput('note', f ? f.note || '' : '', 'maxlength="120"'))}`;
+    ${field('Observação (opcional)', textInput('note', f ? f.note || '' : '', 'maxlength="120"'))}
+    ${field('Usar nas sugestões de cardápio?', selectInput('healthy', [{ v: 'auto', t: 'Automático (o app avalia)' }, { v: 'yes', t: 'Sim, é saudável' }, { v: 'no', t: 'Não usar nas sugestões' }], f && f.healthy ? f.healthy : 'auto'), 'Só alimentos considerados saudáveis entram nas sugestões.')}`;
   openModal({
     title: f ? 'Editar alimento' : 'Cadastrar alimento', body, submitText: f ? 'Salvar alterações' : 'Cadastrar',
     onOpen: form => {
@@ -1611,10 +1833,18 @@ function openFood(id) {
         gpu = parseNum(fd.get('gPerUnit')) || guessGPU(name);
         if (gpu <= 0 || gpu > 2000) return fieldError(form, 'gPerUnit', 'Informe o peso de cada unidade em gramas.');
       }
-      const rec = { name, cat: fd.get('cat'), qty, unit, kcal, p, c, f: fa, gPerUnit: gpu, note: (fd.get('note') || '').trim() };
-      if (f) { Object.assign(f, rec); toast('Alimento atualizado.'); }
-      else { S.foods.push({ id: uid(), ...rec }); toast('Alimento cadastrado.'); }
-      save(); render();
+      const h = fd.get('healthy');
+      const rec = { name, cat: fd.get('cat'), qty, unit, kcal, p, c, f: fa, gPerUnit: gpu, note: (fd.get('note') || '').trim(), healthy: h === 'yes' || h === 'no' ? h : '' };
+      let msg;
+      if (f) { Object.assign(f, rec); msg = 'Alimento atualizado. As sugestões já usam os novos valores.'; }
+      else {
+        const nf = { id: uid(), ...rec };
+        S.foods.push(nf);
+        if (ui.homeSel) ui.homeSel.add(nf.id);
+        ui.homeDraft.add(nf.id); ui.homeMsg = null;
+        msg = foodHealthy(nf) ? 'Alimento cadastrado. Ele já entra nas sugestões.' : 'Alimento cadastrado, mas fica fora das sugestões por não ser considerado saudável.';
+      }
+      save(); render(); toast(msg);
     }
   });
 }
@@ -1624,6 +1854,8 @@ async function deleteFood(id) {
   const ok = await confirmDialog({ title: 'Excluir alimento?', text: `“${f.name}” sai da sua lista e deixa de aparecer nas sugestões.`, okText: 'Excluir', danger: true });
   if (!ok) return;
   S.foods = S.foods.filter(x => x.id !== id);
+  if (ui.homeSel) { ui.homeSel.delete(id); if (!ui.homeSel.size) ui.homeSel = null; }
+  ui.homeDraft.delete(id);
   save(); render(); toast('Alimento excluído.');
 }
 function commonFoodsPicker(existingNorms) {
@@ -1673,7 +1905,7 @@ async function importData(file) {
     S = migrate(data);
     if (!S.profile.onboarded && S.weights.length) S.profile.onboarded = true;
     checkGoals();
-    save(); ui.tab = 'home';
+    save(); ui.tab = 'home'; ui.homeSel = null; ui.homeDraft = new Set(); ui.homeMsg = null;
     $('#onboard').innerHTML = ''; document.body.classList.remove('ob-open');
     render(); toast('Dados importados com sucesso.');
   } catch (e) {
@@ -1687,7 +1919,7 @@ async function wipeAll() {
   if (!b) return;
   try { localStorage.removeItem(STORE_KEY); } catch (e) { /* ignora */ }
   S = defaultState();
-  ui.tab = 'home';
+  ui.tab = 'home'; ui.homeSel = null; ui.homeDraft = new Set(); ui.homeMsg = null; ui.homeText = '';
   render();
   startOnboarding();
   toast('Dados apagados.');
@@ -1885,6 +2117,15 @@ function render(keepScroll = true) {
 }
 function goTab(tab) { ui.tab = tab; render(false); window.scrollTo(0, 0); }
 
+function readHomeText() {
+  const inp = $('#home-text');
+  if (inp) ui.homeText = inp.value;
+  if (!ui.homeText.trim()) { ui.homeMsg = null; return; }
+  const r = parseHomeText(ui.homeText);
+  r.found.forEach(f => ui.homeDraft.add(f.id));
+  ui.homeMsg = { found: r.found.map(f => f.name), missing: r.missing };
+}
+
 const actions = {
   go: el => { if (el.dataset.diet) ui.dietTab = el.dataset.diet; goTab(el.dataset.tab); },
   'go-settings': () => goTab('settings'),
@@ -1912,6 +2153,18 @@ const actions = {
     const g = S.goals.find(x => x.id === el.dataset.id); closeModal(true);
     if (g) openGoal(null, { start: goalMetrics(g).curG, target: g.targetWeight - 5 });
   },
+  'menu-shuffle': () => { ui.seed++; render(); },
+  'home-parse': () => { readHomeText(); render(); },
+  'home-all': () => { S.foods.forEach(f => ui.homeDraft.add(f.id)); render(); },
+  'home-none': () => { ui.homeDraft.clear(); ui.homeMsg = null; render(); },
+  'home-reset': () => { ui.homeSel = null; render(); },
+  'home-run': () => {
+    readHomeText();
+    if (!ui.homeDraft.size) { render(); toast('Marque ou digite ao menos um alimento.', 'error'); return; }
+    ui.homeSel = new Set(ui.homeDraft); ui.seed++; render(false);
+    setTimeout(() => { const el = $('.menu-group'); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 60);
+  },
+  'food-add-name': el => openFood(null, { name: el.dataset.name }),
   'food-add': () => openFood(),
   'food-edit': el => openFood(el.dataset.id),
   'food-del': el => deleteFood(el.dataset.id),
@@ -1930,6 +2183,7 @@ function bindEvents() {
     if (fn) { e.preventDefault(); fn(el, e); }
   });
   document.addEventListener('input', e => {
+    if (e.target.id === 'home-text') { ui.homeText = e.target.value; return; }
     if (e.target.id === 'food-q') {
       ui.foodQ = e.target.value;
       const l = $('#food-list'); if (l) l.innerHTML = foodListHtml();
@@ -1941,6 +2195,7 @@ function bindEvents() {
     if (e.target.id === 'settings-form') { e.preventDefault(); submitSettings(e.target); }
   });
   document.addEventListener('change', e => {
+    if (e.target.dataset && e.target.dataset.home) { if (e.target.checked) ui.homeDraft.add(e.target.dataset.home); else ui.homeDraft.delete(e.target.dataset.home); return; }
     if (e.target.id === 'import-file') { importData(e.target.files[0]); e.target.value = ''; }
   });
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && $('#modal-root').innerHTML && !$('#confirm-root').innerHTML) closeModal(); });

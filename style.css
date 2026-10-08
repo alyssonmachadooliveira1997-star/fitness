@@ -454,3 +454,22 @@ details[open] > summary .chev { transform: rotate(180deg); }
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
 @media print { .bottomnav, .topbar, .sidenav, .fab, .toast { display: none !important; } .main { margin: 0; } }
+
+/* ---------- "O que tenho em casa?" ---------- */
+.home-box { background: var(--lil-50); border-radius: var(--r-lg); padding: 18px; display: flex; flex-direction: column; gap: 12px; margin-bottom: 20px; }
+.home-text { display: flex; gap: 8px; align-items: center; }
+.home-text input { flex: 1; min-width: 0; }
+.home-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+.home-head span { display: flex; gap: 14px; }
+.hchips { display: flex; flex-wrap: wrap; gap: 8px; }
+.hchip { position: relative; }
+.hchip input { position: absolute; opacity: 0; inset: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.hchip span { display: inline-flex; align-items: center; min-height: 40px; padding: 6px 14px; border-radius: 999px; background: #fff; border: 1.5px solid var(--line); font-size: .88rem; font-weight: 600; color: var(--muted); }
+.hchip input:checked + span { background: var(--teal-100); border-color: var(--teal-400); color: var(--teal-800); }
+.hchip input:checked + span::before { content: "✓"; margin-right: 6px; font-weight: 800; }
+.hchip input:focus-visible + span { outline: 3px solid var(--lil-300); outline-offset: 2px; }
+.miss-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; background: #fff; border-radius: var(--r-sm); padding: 8px 12px; font-size: .88rem; }
+.found-ok { display: flex; gap: 8px; align-items: flex-start; color: var(--teal-800); font-weight: 600; }
+.found-ok .ic { width: 18px; height: 18px; margin-top: 2px; }
+.opt { font-size: .8rem; font-weight: 800; color: var(--lil-700); }
+.badge.tiny { font-size: .72rem; padding: 2px 10px; align-self: flex-start; margin-top: 4px; }
